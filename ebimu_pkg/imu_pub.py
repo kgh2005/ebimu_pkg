@@ -1,129 +1,181 @@
+#!/usr/bin/env python3
+import math
+import serial
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile
-import serial
-import re
-import math
+from rclpy.duration import Duration
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Imu
 from geometry_msgs.msg import Quaternion
 
 class EbimuPublisher(Node):
-
+    """
+    EBIMU 시리얼 -> /bhr_b3/imu 퍼블리시 (SI 단위, z드리프트 완화 옵션 포함)
+    - accel_scale:   g -> m/s^2 (default 9.80665)
+    - gyro_in_deg:   True면 deg/s 입력을 rad/s로 변환
+    - invert_accel_sign: True면 가속도 부호 반전(장치 정의에 맞춰 선택)
+    - use_imu_orientation: False면 쿼터니언 무시(orientation unknown으로 전달)
+    - reliability:   reliable / best_effort 선택
+    - stamp_offset_sec: 타임스탬프에 상수 오프셋(±초) 추가 (IMU↔LiDAR 시간정렬용)
+    - accel_bias_si: [bx,by,bz] m/s^2 단위 상수 바이어스 제거 (필요시)
+    - frame_id:      기본 imu_link (정적TF로 base_link↔imu_link 연결 권장)
+    """
     def __init__(self):
         super().__init__('ebimu_publisher')
-        qos_profile = QoSProfile(depth=10)
 
-        # IMU 데이터 퍼블리셔 설정
-        self.imu_pub = self.create_publisher(Imu, '/imu/data', qos_profile)
+        # === 파라미터 ===
+        self.port     = self.declare_parameter('port', '/dev/ttyUSB0').get_parameter_value().string_value
+        self.baud     = self.declare_parameter('baud', 115200).get_parameter_value().integer_value
+        self.frame_id = self.declare_parameter('frame_id', 'base_link').get_parameter_value().string_value
 
-        # 시리얼 포트 설정
-        self.comport_num = "/dev/ttyUSB0"
-        self.comport_baudrate = 115200
+        self.accel_scale = self.declare_parameter('accel_scale', 9.80665).get_parameter_value().double_value
+        self.gyro_in_deg = self.declare_parameter('gyro_in_deg', True).get_parameter_value().bool_value
+        self.invert_accel_sign = self.declare_parameter('invert_accel_sign', True).get_parameter_value().bool_value
+        self.use_imu_orientation = self.declare_parameter('use_imu_orientation', False).get_parameter_value().bool_value
 
+        # 타임오프셋(초). IMU time이 LiDAR보다 "뒤"면 양수, "앞"이면 음수 쪽을 시도.
+        self.stamp_offset_sec = self.declare_parameter('stamp_offset_sec', 0.0).get_parameter_value().double_value
+
+        # 상수 바이어스 보정(m/s^2). 정지 평균에서 (x,y,z) 편차를 측정해서 넣으면 좋음.
+        self.accel_bias_si = list(self.declare_parameter('accel_bias_si', [0.0, 0.0, 0.0])
+                                  .get_parameter_value().double_array_value)
+
+        # 공분산(필요 시 튜닝)
+        self.ori_cov = list(self.declare_parameter('orientation_cov',
+                         [0.0007, 0.0, 0.0,
+                          0.0, 0.0007, 0.0,
+                          0.0, 0.0, 0.0007]).get_parameter_value().double_array_value)
+        self.gyr_cov = list(self.declare_parameter('gyro_cov',
+                         [0.001, 0.0, 0.0,
+                          0.0, 0.001, 0.0,
+                          0.0, 0.0, 0.001]).get_parameter_value().double_array_value)
+        self.acc_cov = list(self.declare_parameter('accel_cov',
+                         [0.005, 0.0, 0.0,
+                          0.0, 0.005, 0.0,
+                          0.0, 0.0, 0.005]).get_parameter_value().double_array_value)
+
+        # QoS
+        rel_str = self.declare_parameter('reliability', 'reliable').get_parameter_value().string_value.lower()
+        depth   = self.declare_parameter('depth', 100).get_parameter_value().integer_value
+        qos = QoSProfile(depth=depth)
+        qos.history = HistoryPolicy.KEEP_LAST
+        qos.reliability = ReliabilityPolicy.RELIABLE if rel_str == 'reliable' else ReliabilityPolicy.BEST_EFFORT
+
+        self.imu_pub = self.create_publisher(Imu, '/imu/data', qos)
+
+        # 시리얼
         try:
-            self.ser = serial.Serial(port=self.comport_num, baudrate=self.comport_baudrate, timeout=1)
-            self.get_logger().info("Connected to IMU Serial Port")
+            self.ser = serial.Serial(port=self.port, baudrate=self.baud, timeout=1)
+            self.get_logger().info(f"Connected EBIMU: {self.port} @ {self.baud}")
         except serial.SerialException as e:
             self.get_logger().error(f"Serial Port Error: {e}")
-            return
+            raise
 
-        # IMU 초기화 메시지 전송
+        # 기기 설정
         self.setup_imu()
 
-        # 타이머 설정 (10ms 간격 = 100Hz)
-        self.timer_period = 0.01
-        self.timer = self.create_timer(self.timer_period, self.timer_callback)
-
-        # 이전 데이터 저장
-        self.prev_str = ""
+        # 100Hz
+        self.timer = self.create_timer(0.005, self.timer_callback)
 
     def setup_imu(self):
-        """ IMU의 데이터 출력을 설정하는 함수 """
-        setup_cmds = [
+        cmds = [
             "<sof2>",  # Quaternion ON
             "<sog1>",  # Angular velocity ON
             "<soa1>",  # Linear acceleration ON
             "<sem1>",  # Magnetometer ON
             "<sot0>",  # Temperature OFF
             "<sod0>",  # Distance OFF
-            "<sor10>"  # Output rate 100Hz 설정
+            "<sor10>"  # Output 100Hz
         ]
-
-        for cmd in setup_cmds:
-            self.ser.write(cmd.encode())
-            self.get_logger().info(f"IMU 설정: {cmd}")
-            self.ser.readline()  # 응답 읽기
+        for c in cmds:
+            try:
+                self.ser.write(c.encode())
+                _ = self.ser.readline()
+            except serial.SerialException as e:
+                self.get_logger().warn(f"IMU setup serial error: {e}")
 
     def timer_callback(self):
-        self.ser.reset_input_buffer()
-        ser_data = self.ser.read_until(expected=b'\n').decode('utf-8', errors='ignore').strip()
-
-        # 원시 데이터 디버깅 출력
-        self.get_logger().debug(f"Raw IMU string: {ser_data}")
-
-        # 쉼표 개수로 대략적인 유효성 확인
-        if ',' not in ser_data or '*' not in ser_data:
-            self.get_logger().warn(f"Malformed IMU data (missing * or ,): {ser_data}")
+        try:
+            line = self.ser.read_until(expected=b'\n').decode('utf-8', errors='ignore').strip()
+        except serial.SerialException as e:
+            self.get_logger().warn(f"Serial read error: {e}")
             return
 
-        str_list = ser_data.split(',')
-
-        if '*' in str_list[0]:
-            str_list[0] = str_list[0].split('*')[-1]  # 마지막 부분 사용
-        else:
-            self.get_logger().warn("Received IMU data does not contain '*'")
+        if not line or ',' not in line or '*' not in line:
             return
 
-        # 필드 부족 여부 체크 (최소 10개)
-        if len(str_list) < 10:
-            self.get_logger().warn(f"Incomplete IMU data: {str_list}")
+        parts = line.split(',')
+        if '*' in parts[0]:
+            parts[0] = parts[0].split('*')[-1]
+        if len(parts) < 10:
             return
-
-        self.get_logger().info(f"RAW: {ser_data}")
 
         try:
-            imu_msg = Imu()
-            imu_msg.header.stamp = self.get_clock().now().to_msg()
-            imu_msg.header.frame_id = "imu_link"
+            imu = Imu()
 
-            # Quaternion 순서 변경
-            imu_msg.orientation = Quaternion(
-                x=float(str_list[2]),
-                y=float(str_list[1]),
-                z=float(str_list[0]),
-                w=float(str_list[3])
-            )
-            imu_msg.orientation_covariance = [0.0007, 0.0, 0.0, 0.0, 0.0007, 0.0, 0.0, 0.0, 0.0007]
+            # 타임스탬프(+오프셋)
+            now = self.get_clock().now()
+            if abs(self.stamp_offset_sec) > 0.0:
+                now = now + Duration(seconds=self.stamp_offset_sec)
+            imu.header.stamp = now.to_msg()
+            imu.header.frame_id = self.frame_id
 
-            # 가속도 (중력 영향 포함)
-            imu_msg.linear_acceleration.x = -float(str_list[7])
-            imu_msg.linear_acceleration.y = -float(str_list[8])
-            imu_msg.linear_acceleration.z = -float(str_list[9])
-            imu_msg.linear_acceleration_covariance = [0.005, 0.0, 0.0, 0.0, 0.005, 0.0, 0.0, 0.0, 0.005]
+            # Orientation
+            if self.use_imu_orientation:
+                imu.orientation = Quaternion(
+                    x=float(parts[2]),
+                    y=float(parts[1]),
+                    z=float(parts[0]),
+                    w=float(parts[3])
+                )
+                imu.orientation_covariance = self.ori_cov
+            else:
+                imu.orientation.x = 0.0
+                imu.orientation.y = 0.0
+                imu.orientation.z = 0.0
+                imu.orientation.w = 1.0
+                imu.orientation_covariance = [-1.0, 0.0, 0.0,
+                                              0.0, -1.0, 0.0,
+                                              0.0, 0.0, -1.0]
 
-            # 각속도 (도 → 라디안 변환)
-            imu_msg.angular_velocity.x = math.radians(float(str_list[4]))
-            imu_msg.angular_velocity.y = math.radians(float(str_list[5]))
-            imu_msg.angular_velocity.z = math.radians(float(str_list[6]))
-            imu_msg.angular_velocity_covariance = [0.001, 0.0, 0.0, 0.0, 0.001, 0.0, 0.0, 0.0, 0.001]
+            # Gyro
+            gx = float(parts[4]); gy = float(parts[5]); gz = float(parts[6])
+            if self.gyro_in_deg:
+                gx = math.radians(gx); gy = math.radians(gy); gz = math.radians(gz)
+            imu.angular_velocity.x = gx
+            imu.angular_velocity.y = gy
+            imu.angular_velocity.z = gz
+            imu.angular_velocity_covariance = self.gyr_cov
 
-            self.imu_pub.publish(imu_msg)
+            # Accel (g→SI) + 부호 + 상수 바이어스 보정
+            ax = float(parts[7]); ay = float(parts[8]); az = float(parts[9])
+            sign = -1.0 if self.invert_accel_sign else 1.0
+            ax_si = sign * ax * self.accel_scale - self.accel_bias_si[0]
+            ay_si = sign * ay * self.accel_scale - self.accel_bias_si[1]
+            az_si = sign * az * self.accel_scale - self.accel_bias_si[2]
+            imu.linear_acceleration.x = ax_si
+            imu.linear_acceleration.y = ay_si
+            imu.linear_acceleration.z = -az_si
+            imu.linear_acceleration_covariance = self.acc_cov
+
+            # (옵션) 정지 상태에서 노름 모니터
+            # a_norm = math.sqrt(ax_si*ax_si + ay_si*ay_si + az_si*az_si)
+            # if abs(a_norm - 9.80665) > 3.0:
+            #     self.get_logger().debug(f"Accel norm={a_norm:.2f}")
+
+            self.imu_pub.publish(imu)
 
         except (ValueError, IndexError) as e:
-            self.get_logger().warn(f"IMU 데이터 파싱 오류: {e}, 원문: {str_list}")
-
-
+            self.get_logger().warn(f"Parse error: {e} | raw: {parts}")
 
 def main(args=None):
     rclpy.init(args=args)
     node = EbimuPublisher()
-
     try:
         rclpy.spin(node)
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
